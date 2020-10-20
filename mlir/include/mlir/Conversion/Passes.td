@@ -210,6 +210,17 @@ def SCFToStandard : Pass<"convert-scf-to-std"> {
 }
 
 //===----------------------------------------------------------------------===//
+// SCFToAffine
+//===----------------------------------------------------------------------===//
+
+def SCFToAffine : Pass<"convert-scf-to-affine"> {
+  let summary = "Convert SCF dialect to Affine dialect, replacing structured"
+                " loads/stores with affine loads/stores";
+  let constructor = "mlir::createRaiseToAffinePass()";
+  let dependentDialects = ["AffineDialect", "scf::SCFDialect"];
+}
+
+//===----------------------------------------------------------------------===//
 // SCFToGPU
 //===----------------------------------------------------------------------===//
 
