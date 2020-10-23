@@ -1,4 +1,4 @@
-//===- SCFToStandard.cpp - ControlFlow to CFG conversion ------------------===//
+//===- SCFToAffine.cpp - Raising SCF to Affine conversion ------------------===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -11,7 +11,6 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "mlir/Conversion/SCFToStandard/SCFToStandard.h" // JC: TO DELETE
 
 #include "mlir/Conversion/SCFToAffine/SCFToAffine.h"
 #include "mlir/IR/AffineMap.h"
@@ -28,45 +27,15 @@
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/Passes.h"
 #include "mlir/Transforms/Utils.h"
-// jc to delete
-#include <sstream>
+
 
 using namespace mlir;
 using namespace mlir::scf;
 
 
-
-bool isConstant(Value value){
-  if (!value.getDefiningOp())
-    return false;
-  else if (isa<ConstantOp>(value.getDefiningOp()))
-      return true;
-  else if (auto indexCastOp = dyn_cast<IndexCastOp>(value.getDefiningOp())){
-      // the result of a constant operation casted from another type
-    if (isa<ConstantOp>(indexCastOp.getOperand().getDefiningOp()))
-        return true;
-  }
-  return false;
-}
-
-int getConstantInt(Value value){
-  assert(isConstant(value));
-  if (auto constant = dyn_cast<ConstantOp>(value.getDefiningOp()))
-      return constant.getValue().cast<IntegerAttr>().getInt();
-  else if (auto indexCastOp = dyn_cast<IndexCastOp>(value.getDefiningOp())){
-      // the result of a constant operation casted from another type
-    if (auto castConstant = dyn_cast<ConstantOp>(indexCastOp.getOperand().getDefiningOp()))
-        return castConstant.getValue().cast<IntegerAttr>().getInt();
-  }
-  return NULL;
-}
-
 namespace {
 
-//===----------------------------------------------------------------------===//
 // Conversion Target
-//===----------------------------------------------------------------------===//
-
 class SCFToAffineTarget : public ConversionTarget {
 public:
   explicit SCFToAffineTarget(MLIRContext &context)
@@ -74,30 +43,36 @@ public:
 
   bool isDynamicallyLegal(Operation *op) const override {
     if (auto forOp = dyn_cast<scf::ForOp>(op)){
-      auto step = forOp.step();
-      auto lb = forOp.lowerBound();
-      auto ub = forOp.upperBound();
-      return !(SSACheck(step) && SSACheck(lb) && SSACheck(ub));
+      if (forOp.getNumResults() > 0) // JC: affine.for with results seems not supported?
+        return true;
+      else if (auto cst = forOp.step().getDefiningOp<ConstantIndexOp>()){
+        // step > 0 already verified in SCF dialect
+        auto lb = forOp.lowerBound();
+        auto ub = forOp.upperBound();
+        // if (!(SSACheck(lb, forOp) && SSACheck(ub, forOp)))
+        if (!(isValidSymbol(lb) && isValidSymbol(ub)))
+          return true;
+        else {
+          return false;
+        }
+      }
+      else    // only constant step supported in affine.for
+        return true;
     }
     else if (auto loadOp = dyn_cast<LoadOp>(op)){
+      /*while (auto op = loadOp.getParentOp()){
+        if (isa<AffineForOp>(op)){
+          for (auto i = 0; i < loadOp.getNumOperands)
+        }
+      }*/
       return false;
+      // return isValidDim(loadOp.getOperand(1));
     }
     else
       return true;
   }
 
-  bool SSACheck(Value value) const {
-    if (isConstant(value))  // 4. the result of a constant operation ,
-      return true;
-    else
-      return false;
-  }
-};
-
-//===----------------------------------------------------------------------===//
 // Rewriting Pass
-//===----------------------------------------------------------------------===//
-
 struct SCFToAffinePass : public SCFToAffineBase<SCFToAffinePass> {
   void runOnOperation() override;
 };
@@ -113,7 +88,6 @@ struct StoreRaising : public OpRewritePattern<StoreOp> {
                                 PatternRewriter &rewriter) const override;
 };
 
-
 struct SCFForRaising : public OpRewritePattern<ForOp> {
   using OpRewritePattern<ForOp>::OpRewritePattern;
 
@@ -122,11 +96,11 @@ struct SCFForRaising : public OpRewritePattern<ForOp> {
 };
 } // namespace
 
-// JC to do - raise it to affine.for if possible
+// Raise scf.for to affine.for & replace scf.yield with affine.yield
 LogicalResult SCFForRaising::matchAndRewrite(ForOp forOp,
                                            PatternRewriter &rewriter) const {
   Location loc = forOp.getLoc();
-  
+  auto ctx = rewriter.getContext();
   auto step = forOp.step();
   auto lb = forOp.lowerBound();
   auto ub = forOp.upperBound();
@@ -135,104 +109,34 @@ LogicalResult SCFForRaising::matchAndRewrite(ForOp forOp,
   auto iterOperands = forOp.getIterOperands();
   auto iterArgs = forOp.getRegionIterArgs();
   AffineForOp::BodyBuilderFn bodyBuilder;
-  // if constant bound
-  // int stepNum = (isa<ConstantOp>(step.getDefiningOp())) ? step.getDefiningOp().getValue():dyn_cast<IndexCastOp>(step.getDefiningOp()).getOperand().getValue();
-  // int lbNum = (isa<ConstantOp>(lb.getDefiningOp())) ? lb.getDefiningOp().getValue():dyn_cast<IndexCastOp>(lb.getDefiningOp()).getOperand().getValue();
-  // int ubNum = (isa<ConstantOp>(ub.getDefiningOp())) ? ub.getDefiningOp().getValue():dyn_cast<IndexCastOp>(ub.getDefiningOp()).getOperand().getValue();
-  auto f = rewriter.create<AffineForOp>(loc, 0, 1000, 1, iterArgs, bodyBuilder);
+  int stepNum = dyn_cast<ConstantOp>(step.getDefiningOp()).getValue().cast<IntegerAttr>().getInt();
+  AffineMap directSymbolMap = AffineMap::get(0, 1, getAffineSymbolExpr(0, rewriter.getContext()));
+  auto f = rewriter.create<AffineForOp>(loc, lb, directSymbolMap, ub, directSymbolMap, stepNum, iterArgs, bodyBuilder);
   rewriter.eraseBlock(f.getBody());
   Operation *loopTerminator = forOp.region().back().getTerminator();
   ValueRange terminatorOperands = loopTerminator->getOperands();
   rewriter.setInsertionPointToEnd(&forOp.region().back());
   rewriter.create<AffineYieldOp>(loc, terminatorOperands);
-  rewriter.eraseOp(loopTerminator);
+  
   rewriter.inlineRegionBefore(forOp.region(), f.region(), f.region().end());
+  rewriter.eraseOp(loopTerminator);
   rewriter.eraseOp(forOp);
 
-  /*
-    Location loc = op.getLoc();
-    Value lowerBound = lowerAffineLowerBound(op, rewriter);
-    Value upperBound = lowerAffineUpperBound(op, rewriter);
-    Value step = rewriter.create<ConstantIndexOp>(loc, op.getStep());
-    auto f = rewriter.create<scf::ForOp>(loc, lowerBound, upperBound, step);
-    rewriter.eraseBlock(f.getBody());
-    rewriter.inlineRegionBefore(op.region(), f.region(), f.region().end());
-    rewriter.eraseOp(op);
-    return success();
-  */
-
-  // Start by splitting the block containing the 'scf.for' into two parts.
-  // The part before will get the init code, the part after will be the end
-  // point.
-  /*auto *initBlock = rewriter.getInsertionBlock();
-  auto initPosition = rewriter.getInsertionPoint();
-  auto *endBlock = rewriter.splitBlock(initBlock, initPosition);
-
-  // Use the first block of the loop body as the condition block since it is the
-  // block that has the induction variable and loop-carried values as arguments.
-  // Split out all operations from the first block into a new block. Move all
-  // body blocks from the loop body region to the region containing the loop.
-  auto *conditionBlock = &forOp.region().front();
-  auto *firstBodyBlock =
-      rewriter.splitBlock(conditionBlock, conditionBlock->begin());
-  auto *lastBodyBlock = &forOp.region().back();
-  rewriter.inlineRegionBefore(forOp.region(), endBlock);
-  auto iv = conditionBlock->getArgument(0);
-
-  // Append the induction variable stepping logic to the last body block and
-  // branch back to the condition block. Loop-carried values are taken from
-  // operands of the loop terminator.
-  Operation *terminator = lastBodyBlock->getTerminator();
-  rewriter.setInsertionPointToEnd(lastBodyBlock);
-  auto step = forOp.step();
-  auto stepped = rewriter.create<AddIOp>(loc, iv, step).getResult();
-  if (!stepped)
-    return failure();
-
-  SmallVector<Value, 8> loopCarried;
-  loopCarried.push_back(stepped);
-  loopCarried.append(terminator->operand_begin(), terminator->operand_end());
-  rewriter.create<BranchOp>(loc, conditionBlock, loopCarried);
-  rewriter.eraseOp(terminator);
-
-  // Compute loop bounds before branching to the condition.
-  rewriter.setInsertionPointToEnd(initBlock);
-  Value lowerBound = forOp.lowerBound();
-  Value upperBound = forOp.upperBound();
-  if (!lowerBound || !upperBound)
-    return failure();
-
-  // The initial values of loop-carried values is obtained from the operands
-  // of the loop operation.
-  SmallVector<Value, 8> destOperands;
-  destOperands.push_back(lowerBound);
-  auto iterOperands = forOp.getIterOperands();
-  destOperands.append(iterOperands.begin(), iterOperands.end());
-  rewriter.create<BranchOp>(loc, conditionBlock, destOperands);
-
-  // With the body block done, we can fill in the condition block.
-  rewriter.setInsertionPointToEnd(conditionBlock);
-  auto comparison =
-      rewriter.create<CmpIOp>(loc, CmpIPredicate::slt, iv, upperBound);
-
-  rewriter.create<CondBranchOp>(loc, comparison, firstBodyBlock,
-                                ArrayRef<Value>(), endBlock, ArrayRef<Value>());
-  // The result of the loop operation is the values of the condition block
-  // arguments except the induction variable on the last iteration.
-  rewriter.replaceOp(forOp, conditionBlock->getArguments().drop_front());*/
   return success();
 }
 
-AffineExpr getAffineExpr(Value v, AffineExpr expr, bool *collect,
+// Extract the affine expression from a number of std instructions
+AffineExpr getAffineExpr(Value value, AffineExpr expr, bool *collect,
                                            PatternRewriter &rewriter){
-  if (isConstant(v))
-    return getAffineConstantExpr(getConstantInt(v), rewriter.getContext());
-  else if (isValidSymbol(v) && !isValidDim(v))
+  if (auto constant = dyn_cast_or_null<ConstantOp>(value.getDefiningOp()))
+    return getAffineConstantExpr(constant.getValue().cast<IntegerAttr>().getInt(), rewriter.getContext());
+  else if (isValidSymbol(value) && !isValidDim(value))
     return getAffineSymbolExpr(0, rewriter.getContext());
   else
     return getAffineDimExpr(0, rewriter.getContext());
 }
 
+// Raise std.load to affine.load
 LogicalResult LoadRaising::matchAndRewrite(LoadOp loadOp,
                                            PatternRewriter &rewriter) const {
   Location loc = loadOp.getLoc();
@@ -241,11 +145,7 @@ LogicalResult LoadRaising::matchAndRewrite(LoadOp loadOp,
   for (int i = 1; i < loadOp.getNumOperands(); i++){
     bool collect = false;
     AffineExpr exprInit;
-    // std::string resultName;
-    // llvm::raw_string_ostream string_stream(resultName);
-    // loadOp.getOperand(i).print(string_stream);
-    // return loadOp.emitOpError("debug found: " + resultName + "\n");
-    lhs_indices = {loadOp.getOperand(i)};
+    lhs_indices = {loadOp.getOperand(i)}; // 1D array for
     /*AffineExpr*/ expr = getAffineExpr(loadOp.getOperand(i), exprInit, &collect, rewriter);
   }
    
@@ -263,13 +163,12 @@ void mlir::analyzeAndTransformMemoryOps(
 void SCFToAffinePass::runOnOperation() {
   OwningRewritePatternList patterns;
   analyzeAndTransformMemoryOps(patterns, &getContext());
-  // Configure conversion to lower out scf.for, scf.if and scf.parallel.
+  // Configure conversion to raise scf.for, std.load and std.store.
   // Anything else is fine.
   SCFToAffineTarget target(getContext());
   target.addLegalDialect<SCFDialect, AffineDialect>();
   target.addDynamicallyLegalOp<scf::ForOp>();
-  
-  target.addDynamicallyLegalOp<LoadOp/*, StoreOp*/>();
+  target.addDynamicallyLegalOp<LoadOp/*, StoreOp*/>();  // JC TODO: STORE
 
   target.markUnknownOpDynamicallyLegal([](Operation *) { return true; });
   if (failed(applyPartialConversion(getOperation(), target, patterns)))
