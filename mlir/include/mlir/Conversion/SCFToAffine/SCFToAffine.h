@@ -20,15 +20,22 @@ class RewritePattern;
 
 // Owning list of rewriting patterns.
 class OwningRewritePatternList;
-
-/// Collect a set of patterns to lower from scf.for, scf.if, and
-/// loop.terminator to CFG operations within the Standard dialect, in particular
-/// convert structured control flow into CFG branch-based control flow.
-void analyzeAndTransformMemoryOps(OwningRewritePatternList &patterns,
+  
+/// Collect a set of patterns to raise scf.for and scf.yield
+/// to affine.for and affine.yield
+void SCFForRaisingPatterns(OwningRewritePatternList &patterns,
                                          MLIRContext *ctx);
-
-/// Creates a pass to convert std.load and std.load ops to affine.load and affine.store ops.
-std::unique_ptr<Pass> createRaiseToAffinePass();
+/// Creates a pass to convert scf.for and scf.yield ops
+/// to affine.for and affine.yield
+std::unique_ptr<Pass> createRaiseSCFForPass();
+  
+/// Collect a set of patterns to raise std.load and std.store
+/// to affine.load and affine.store
+void loadStoreRaisingPatterns(OwningRewritePatternList &patterns,
+                                         MLIRContext *ctx);
+/// Creates a pass to convert std.load and std.store to 
+/// affine.load and affine.store.
+std::unique_ptr<Pass> createRaiseLoadStorePass();
 
 } // namespace mlir
 
