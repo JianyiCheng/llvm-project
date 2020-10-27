@@ -210,14 +210,35 @@ def SCFToStandard : Pass<"convert-scf-to-std"> {
 }
 
 //===----------------------------------------------------------------------===//
-// SCFToAffine
+// SCFForRaising
 //===----------------------------------------------------------------------===//
 
-def SCFToAffine : Pass<"convert-scf-to-affine"> {
-  let summary = "Convert SCF dialect to Affine dialect, replacing structured"
-                " loads/stores with affine loads/stores";
-  let constructor = "mlir::createRaiseToAffinePass()";
-  let dependentDialects = ["AffineDialect", "scf::SCFDialect"];
+def SCFForRaising : Pass<"scffor-raising"> {
+  let summary = "Convert scf.for and scf.yield ops to affine.for and "
+                "affine.yield ops";
+  let constructor = "mlir::createRaiseSCFForPass()";
+  let dependentDialects = ["AffineDialect", "scf::SCFDialect", "StandardOpsDialect"];
+}
+
+//===----------------------------------------------------------------------===//
+// LoadStoreRaising
+//===----------------------------------------------------------------------===//
+
+def LoadStoreRaising : Pass<"load-store-raising"> {
+  let summary = "Convert std.load and std.store ops to  affine.load and "
+                "affine.store ops";
+  let constructor = "mlir::createRaiseLoadStorePass()";
+  let dependentDialects = ["AffineDialect", "scf::SCFDialect", "StandardOpsDialect"];
+}
+
+//===----------------------------------------------------------------------===//
+// OpCleaning
+//===----------------------------------------------------------------------===//
+
+def OpCleaning : Pass<"op-cleaning"> {
+  let summary = "Remove unreferenced ops";
+  let constructor = "mlir::createCleanOpPass()";
+  let dependentDialects = ["AffineDialect", "scf::SCFDialect", "StandardOpsDialect"];
 }
 
 //===----------------------------------------------------------------------===//
