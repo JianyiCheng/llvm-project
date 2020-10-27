@@ -6,8 +6,9 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// This file implements a pass to convert scf.for, scf.if and loop.terminator
-// ops into standard CFG ops.
+// This file implements a pass to convert scf.for, scf.yield, std.load 
+// and std.store ops into affine.for, affine.yield, affine.load and 
+// affine.store ops.
 //
 //===----------------------------------------------------------------------===//
 
@@ -32,13 +33,13 @@
 using namespace mlir;
 using namespace mlir::scf;
 
-
+// Raise scf.for and scf.yield to affine.for and affine.yield
+// to enable analysis on dimensions and symbols 
 namespace {
-
 // Conversion Target
-class SCFToAffineTarget : public ConversionTarget {
+class SCFForRaisingTarget : public ConversionTarget {
 public:
-  explicit SCFToAffineTarget(MLIRContext &context)
+  explicit SCFForRaisingTarget(MLIRContext &context)
       : ConversionTarget(context) {}
 
   bool isDynamicallyLegal(Operation *op) const override {
@@ -49,45 +50,22 @@ public:
         // step > 0 already verified in SCF dialect
         auto lb = forOp.lowerBound();
         auto ub = forOp.upperBound();
-        // if (!(SSACheck(lb, forOp) && SSACheck(ub, forOp)))
-        if (!(isValidSymbol(lb) && isValidSymbol(ub)))
-          return true;
-        else {
-          return false;
-        }
+        return !(isValidSymbol(lb) && isValidSymbol(ub));
       }
       else    // only constant step supported in affine.for
         return true;
     }
-    else if (auto loadOp = dyn_cast<LoadOp>(op)){
-      /*while (auto op = loadOp.getParentOp()){
-        if (isa<AffineForOp>(op)){
-          for (auto i = 0; i < loadOp.getNumOperands)
-        }
-      }*/
-      return false;
-      // return isValidDim(loadOp.getOperand(1));
-    }
     else
       return true;
   }
-
+};
+  
 // Rewriting Pass
-struct SCFToAffinePass : public SCFToAffineBase<SCFToAffinePass> {
+struct SCFForRaisingPass : public SCFForRaisingBase<SCFForRaisingPass> {
   void runOnOperation() override;
 };
 
-struct LoadRaising : public OpRewritePattern<LoadOp> {
-  using OpRewritePattern<LoadOp>::OpRewritePattern;
-  LogicalResult matchAndRewrite(LoadOp loadOp,
-                                PatternRewriter &rewriter) const override;
-};
-struct StoreRaising : public OpRewritePattern<StoreOp> {
-  using OpRewritePattern<StoreOp>::OpRewritePattern;
-  LogicalResult matchAndRewrite(StoreOp storeOp,
-                                PatternRewriter &rewriter) const override;
-};
-
+// Raise scf.for to affine.for & replace scf.yield with affine.yield
 struct SCFForRaising : public OpRewritePattern<ForOp> {
   using OpRewritePattern<ForOp>::OpRewritePattern;
 
@@ -97,84 +75,210 @@ struct SCFForRaising : public OpRewritePattern<ForOp> {
 } // namespace
 
 // Raise scf.for to affine.for & replace scf.yield with affine.yield
+// Conversion:
+// Raise scf.for to affine.for:
+// scf.for step -> affine.for step
+// scf.for lb -> affine.for lb
+// scf.for ub -> affine.for ub
+// scf.for iter_ags -> affine.for iter_args
+// scf.yield -> affine.yield
+// scf.for body -> affine.for body
+// create a map for both lb, ub: #map1 = affine_map<()[s0] -> (s0)>
 LogicalResult SCFForRaising::matchAndRewrite(ForOp forOp,
                                            PatternRewriter &rewriter) const {
   Location loc = forOp.getLoc();
-  auto ctx = rewriter.getContext();
+  // map scf.for operands to affine.for
   auto step = forOp.step();
   auto lb = forOp.lowerBound();
   auto ub = forOp.upperBound();
-  auto indVar = forOp.getInductionVar();
-  auto results = forOp.getResults();
-  auto iterOperands = forOp.getIterOperands();
   auto iterArgs = forOp.getRegionIterArgs();
-  AffineForOp::BodyBuilderFn bodyBuilder;
+  // affine.for only accepts a step as a literal
   int stepNum = dyn_cast<ConstantOp>(step.getDefiningOp()).getValue().cast<IntegerAttr>().getInt();
+  // the loop bounds are both valid symbols - direct map #map <()[s0] -> (s0)>
   AffineMap directSymbolMap = AffineMap::get(0, 1, getAffineSymbolExpr(0, rewriter.getContext()));
-  auto f = rewriter.create<AffineForOp>(loc, lb, directSymbolMap, ub, directSymbolMap, stepNum, iterArgs, bodyBuilder);
+  auto f = rewriter.create<mlir::AffineForOp>(loc, lb, directSymbolMap, ub, directSymbolMap, stepNum, iterArgs);
   rewriter.eraseBlock(f.getBody());
   Operation *loopTerminator = forOp.region().back().getTerminator();
   ValueRange terminatorOperands = loopTerminator->getOperands();
   rewriter.setInsertionPointToEnd(&forOp.region().back());
   rewriter.create<AffineYieldOp>(loc, terminatorOperands);
-  
   rewriter.inlineRegionBefore(forOp.region(), f.region(), f.region().end());
   rewriter.eraseOp(loopTerminator);
   rewriter.eraseOp(forOp);
-
   return success();
 }
 
-// Extract the affine expression from a number of std instructions
-AffineExpr getAffineExpr(Value value, AffineExpr expr, bool *collect,
-                                           PatternRewriter &rewriter){
-  if (auto constant = dyn_cast_or_null<ConstantOp>(value.getDefiningOp()))
-    return getAffineConstantExpr(constant.getValue().cast<IntegerAttr>().getInt(), rewriter.getContext());
-  else if (isValidSymbol(value) && !isValidDim(value))
-    return getAffineSymbolExpr(0, rewriter.getContext());
-  else
-    return getAffineDimExpr(0, rewriter.getContext());
-}
-
-// Raise std.load to affine.load
-LogicalResult LoadRaising::matchAndRewrite(LoadOp loadOp,
-                                           PatternRewriter &rewriter) const {
-  Location loc = loadOp.getLoc();
-  AffineExpr expr;
-  SmallVector<Value, 1> lhs_indices{};
-  for (int i = 1; i < loadOp.getNumOperands(); i++){
-    bool collect = false;
-    AffineExpr exprInit;
-    lhs_indices = {loadOp.getOperand(i)}; // 1D array for
-    /*AffineExpr*/ expr = getAffineExpr(loadOp.getOperand(i), exprInit, &collect, rewriter);
-  }
-   
-  AffineMap loadMap = AffineMap::get(1, 0, expr);
-  rewriter.replaceOpWithNewOp<AffineLoadOp>(loadOp, loadOp.getMemRef(), loadMap, lhs_indices);
-  // rewriter.eraseOp(loadOp);
-  return success();
-}
-
-void mlir::analyzeAndTransformMemoryOps(
+void mlir::SCFForRaisingPatterns(
   OwningRewritePatternList &patterns, MLIRContext *ctx) {
-    patterns.insert<SCFForRaising, LoadRaising>(ctx);
+    patterns.insert<SCFForRaising>(ctx);
   }
 
-void SCFToAffinePass::runOnOperation() {
+void SCFForRaisingPass::runOnOperation() {
   OwningRewritePatternList patterns;
-  analyzeAndTransformMemoryOps(patterns, &getContext());
-  // Configure conversion to raise scf.for, std.load and std.store.
-  // Anything else is fine.
-  SCFToAffineTarget target(getContext());
+  SCFForRaisingPatterns(patterns, &getContext());
+  SCFForRaisingTarget target(getContext());
   target.addLegalDialect<SCFDialect, AffineDialect>();
   target.addDynamicallyLegalOp<scf::ForOp>();
-  target.addDynamicallyLegalOp<LoadOp/*, StoreOp*/>();  // JC TODO: STORE
-
   target.markUnknownOpDynamicallyLegal([](Operation *) { return true; });
   if (failed(applyPartialConversion(getOperation(), target, patterns)))
     signalPassFailure();
 }
 
-std::unique_ptr<Pass> mlir::createRaiseToAffinePass() {
-  return std::make_unique<SCFToAffinePass>();
+std::unique_ptr<Pass> mlir::createRaiseSCFForPass() {
+  return std::make_unique<SCFForRaisingPass>();
 }
+
+
+// Raise std.load and std.store to affine.load and affine.store
+// after the affineScope is constructed by raising the scf.for loops
+namespace {
+// Conversion Target
+class LoadStoreRaisingTarget : public ConversionTarget {
+public:
+  explicit LoadStoreRaisingTarget(MLIRContext &context)
+      : ConversionTarget(context) {}
+
+  // return whether the index is in affine expression
+  bool isAffineType(Value value) const {
+    if (isValidDim(value) || isValidSymbol(value))
+      return true;
+    else if (auto op = value.getDefiningOp()){
+      if (isa<MulIOp>(op)){ // cannot recognise the pattern s0*(d1+s2) so far
+        if (isValidSymbol(op->getOperand(0)))
+          return isValidDim(op->getOperand(1));
+        else if (isValidSymbol(op->getOperand(1)))
+          return isValidDim(op->getOperand(0));
+        else
+          return false;
+      } else if (isa<AddIOp>(op))       // affine + affine is affine
+        return (isAffineType(op->getOperand(0)) && isAffineType(op->getOperand(1)));
+      else
+        return false;
+    }
+    else
+      return false;
+  }
+
+  bool isDynamicallyLegal(Operation *op) const override {
+    if (auto loadOp = dyn_cast<LoadOp>(op)){
+      for (unsigned int i = 1; i < loadOp.getNumOperands(); i++){
+        if (!isAffineType(loadOp.getOperand(i)))
+          return true;
+      }
+      return false;
+    }
+    else if (auto storeOp = dyn_cast<StoreOp>(op)){
+      for (unsigned int i = 2; i < storeOp.getNumOperands(); i++){
+        if (!isAffineType(storeOp.getOperand(i)))
+          return true;
+      }
+      return false;
+    }
+    else
+      return true;
+  }
+};
+  
+// Rewriting Pass
+struct LoadStoreRaisingPass : public LoadStoreRaisingBase<LoadStoreRaisingPass> {
+  void runOnOperation() override;
+};
+  
+// Raise std.load to affine.load
+struct LoadRaising : public OpRewritePattern<LoadOp> {
+  using OpRewritePattern<LoadOp>::OpRewritePattern;
+  LogicalResult matchAndRewrite(LoadOp loadOp,
+                                PatternRewriter &rewriter) const override;
+};
+
+// Raise std.store to affine.store
+struct StoreRaising : public OpRewritePattern<StoreOp> {
+  using OpRewritePattern<StoreOp>::OpRewritePattern;
+  LogicalResult matchAndRewrite(StoreOp storeOp,
+                                PatternRewriter &rewriter) const override;
+};
+} // namespace
+
+// Extract the affine expression from a number of std operations
+AffineExpr getAffineExpr(Value value, PatternRewriter &rewriter,
+                std::vector<Value> *dims, std::vector<Value> *symbols){
+  auto op = value.getDefiningOp();
+  assert(op != NULL || isValidDim(value));
+  if (isValidSymbol(value)){
+    int symbolIdx;
+    auto symbolIter = std::find(symbols->begin(), symbols->end(), value);
+    if (symbolIter == symbols->end()){
+      symbolIdx = symbols->size();
+      symbols->push_back(value);
+    }
+    else
+      symbolIdx = std::distance(symbols->begin(), symbolIter);
+    return getAffineSymbolExpr(symbolIdx, rewriter.getContext());
+  }
+  else if (isValidDim(value)){
+    int dimIdx;
+    auto dimIter = std::find(dims->begin(), dims->end(), value);
+    if (dimIter == dims->end()){
+      dimIdx = dims->size();
+      dims->push_back(value);
+    }
+    else
+      dimIdx = std::distance(dims->begin(), dimIter);
+    return getAffineDimExpr(dimIdx, rewriter.getContext());
+  }
+  else if (isa<AddIOp>(op))
+    return getAffineExpr(op->getOperand(0), rewriter, dims, symbols)+getAffineExpr(op->getOperand(1), rewriter, dims, symbols);
+  else if (isa<MulIOp>(op))
+    return getAffineExpr(op->getOperand(0), rewriter, dims, symbols)*getAffineExpr(op->getOperand(1), rewriter, dims, symbols);
+  else
+    return NULL;
+}
+
+// Raise std.load to affine.load
+// for each index of the loadOp, extract its affine expression
+// construct a map with the dim and symbol count for the affine.load
+// replace the loadOp with the newly constructed affine.load
+LogicalResult LoadRaising::matchAndRewrite(LoadOp loadOp,
+                                           PatternRewriter &rewriter) const {
+  std::vector<Value> indices, dims, symbols;
+  std::vector<AffineExpr> exprs;
+
+  for (unsigned int i = 1; i < loadOp.getNumOperands(); i++){
+    indices.push_back(loadOp.getOperand(i));
+    exprs.push_back(getAffineExpr(loadOp.getOperand(i), rewriter, &dims, &symbols));
+  }
+  ArrayRef<AffineExpr> results(exprs);
+  AffineMap affineMap = AffineMap::get(dims.size(), symbols.size(), results, rewriter.getContext());
+  llvm::errs() << affineMap.getNumInputs() << "\n";
+  dims.insert(dims.end(), symbols.begin(), symbols.end());
+  rewriter.replaceOpWithNewOp<AffineLoadOp>(loadOp, loadOp.getMemRef(), affineMap, dims);
+  // rewriter.eraseOp(loadOp);
+  return success();
+}
+
+// Raise std.store to affine.store
+LogicalResult StoreRaising::matchAndRewrite(StoreOp storeOp,
+                                           PatternRewriter &rewriter) const {
+  return success();
+}
+
+void mlir::LoadStoreRaisingPatterns(
+  OwningRewritePatternList &patterns, MLIRContext *ctx) {
+    patterns.insert<LoadRaising, StoreRaising>(ctx);
+  }
+
+void LoadStoreRaisingPass::runOnOperation() {
+  OwningRewritePatternList patterns;
+  LoadStoreRaisingPatterns(patterns, &getContext());
+  LoadStoreRaisingTarget target(getContext());
+  target.addLegalDialect<SCFDialect, AffineDialect>();
+  target.addDynamicallyLegalOp<LoadOp, StoreOp>();
+  target.markUnknownOpDynamicallyLegal([](Operation *) { return true; });
+  if (failed(applyPartialConversion(getOperation(), target, patterns)))
+    signalPassFailure();
+}
+
+std::unique_ptr<Pass> mlir::createRaiseLoadStorePass() {
+  return std::make_unique<LoadStoreRaisingPass>();
+}
+
